@@ -1,12 +1,28 @@
-FROM public.ecr.aws/lambda/python:3.9
+# 1. Use official slim Python image
+FROM python:3.9-slim
 
-# Copy model and code
-COPY models/ /var/task/models/
-COPY app.py /var/task/
-COPY requirements.txt /var/task/
+# 2. Install system deps for audio processing
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ffmpeg \
+      libsndfile1 && \
+    rm -rf /var/lib/apt/lists/*
 
-# Install dependencies into /var/task
-RUN pip3 install -r requirements.txt --target "/var/task"
+# 3. Set working directory
+WORKDIR /app
 
-# Lambda entrypoint
-CMD ["app.handler"]
+# 4. Copy and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 5. Copy your application code and model into the container
+COPY . .
+
+# 6. Expose port and set environment
+ENV FLASK_APP=app.py
+ENV FLASK_RUN_HOST=0.0.0.0
+ENV FLASK_RUN_PORT=5000
+ENV PYTHONUNBUFFERED=1
+
+# 7. Run the app
+CMD ["python", "app.py"]

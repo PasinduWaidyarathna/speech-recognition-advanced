@@ -1,108 +1,140 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
-from mangum import Mangum
+from flask import Flask, request, jsonify, send_file
 import tensorflow as tf
 import numpy as np
+import os
+import io
+import tempfile
 import librosa
 import noisereduce as nr
 import soundfile as sf
-import tempfile
-import os
-import io
+from flask_cors import CORS
+app = Flask(__name__)
+model = None  # Global model variable
+CORS(app)
 
-app = FastAPI()
-handler = Mangum(app)
-
-# Global model variable
-model = None
-MODEL_PATH = "models/lung_sound_classification_model_1.keras"
-
-# Load model
-def load_audio_model(path: str):
+# Load model from file
+def load_audio_model(model_path):
     try:
-        m = tf.keras.models.load_model(path)
+        model = tf.keras.models.load_model(model_path)
         print("Model loaded successfully")
-        return m
+        return model
     except Exception as e:
         print(f"Error loading model: {e}")
         return None
 
-# Initialize model at cold start
-if os.path.exists(MODEL_PATH):
-    model = load_audio_model(MODEL_PATH)
-else:
-    print(f"Model file not found at {MODEL_PATH}")
+# Prediction Function
+def predict_health(audio_data, sr, model):
+    # Preprocess the audio data (adjust as needed for your model)
+    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)  # Example: MFCC features
+    mfccs_processed = np.mean(mfccs.T, axis=0)  # Example: Averaging MFCCs
+    mfccs_processed = mfccs_processed.reshape(1, -1)  # Reshape for model input
 
-# Prediction logic
-def predict_health(audio_data: np.ndarray, sr: int, model) -> tuple:
-    mfccs = librosa.feature.mfcc(y=audio_data, sr=sr, n_mfcc=400)
-    mfccs_processed = np.mean(mfccs.T, axis=0).reshape(1, -1)
-    preds = model.predict(mfccs_processed)
-    class_id = int(np.argmax(preds))
-    confidence = float(np.max(preds))
-    status = "Healthy" if class_id == 1 else "Unhealthy"
+    # Make a prediction
+    prediction = model.predict(mfccs_processed)
+
+    predicted_class = int(np.argmax(prediction))
+    confidence = float(np.max(prediction))
+
+    if predicted_class == 1:
+        status = "Healthy"
+    else:
+        status = "Unhealthy"
+
     return status, confidence
 
-@app.get("/")
-def health_check():
-    return {"status": "Healthy"}
-
-@app.post("/predict")
-async def predict(audio_file: UploadFile = File(...)):
+# Prediction route
+@app.route('/predict', methods=['POST'])
+def predict():
     if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    if not audio_file.filename.lower().endswith(".wav"):
-        raise HTTPException(status_code=400, detail="Only .wav supported")
+        return jsonify({"error": "Model not loaded"}), 503
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp_path = tmp.name
-        tmp.write(await audio_file.read())
+    if 'audio_file' not in request.files:
+        return jsonify({"error": "No audio file provided"}), 400
+
+    file = request.files['audio_file']
+    if file.filename == '':
+        return jsonify({"error": "No audio file selected"}), 400
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+        temp_path = temp_file.name
+        file.save(temp_path)
 
     try:
-        audio, sr = librosa.load(tmp_path, sr=None)
-        status, confidence = predict_health(audio, sr, model)
-        return JSONResponse({"status": status, "confidence": confidence})
+        new_audio, sr = librosa.load(temp_path, sr=None)
+        result = predict_health(new_audio, sr, model)
+        os.remove(temp_path)
+        return jsonify(result), 200
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return jsonify({"error": str(e)}), 500
 
-@app.post("/noise-reduction")
-async def noise_reduction(
-    noise_only: UploadFile = File(...),
-    heart_noisy: UploadFile = File(...)
-):
-    if not noise_only.filename.lower().endswith(".wav") or \
-       not heart_noisy.filename.lower().endswith(".wav"):
-        raise HTTPException(status_code=400, detail="Only .wav files supported")
+# Healthy route
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({"status": "Healthy"}), 200
 
-    paths = {}
-    for key, file in [("noise", noise_only), ("heart", heart_noisy)]:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        paths[key] = tmp.name
-        tmp.write(await file.read())
-        tmp.close()
+# Noise Reduction route
+@app.route('/noise-reduction', methods=['POST'])
+def noise_reduction():
+    # 1) Validate presence of both files
+    if 'noise_only' not in request.files or 'heart_noisy' not in request.files:
+        return jsonify({"error": "Both 'noise_only' and 'heart_noisy' files are required"}), 400
+
+    noise_file = request.files['noise_only']
+    heart_file = request.files['heart_noisy']
+
+    # 2) Validate filenames
+    if noise_file.filename == '' or heart_file.filename == '':
+        return jsonify({"error": "No file selected for one or both fields"}), 400
 
     try:
-        noisy, sr = librosa.load(paths['heart'], sr=None)
-        noise, _ = librosa.load(paths['noise'], sr=sr)
+        # 3) Save uploads to temporary .wav files
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_noise:
+            noise_path = tmp_noise.name
+            noise_file.save(noise_path)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as tmp_heart:
+            heart_path = tmp_heart.name
+            heart_file.save(heart_path)
+
+        # 4) Load with librosa (requires ffmpeg/libsndfile on PATH)
+        noisy, sr = librosa.load(heart_path, sr=None)
+        noise, _ = librosa.load(noise_path, sr=sr)
+
+        # 5) Perform noise reduction
         clean = nr.reduce_noise(y=noisy, y_noise=noise, sr=sr)
 
+        # 6) Write cleaned audio to an in-memory buffer
         buffer = io.BytesIO()
         sf.write(buffer, clean, sr, format='WAV')
         buffer.seek(0)
 
-        return StreamingResponse(
-            buffer,
-            media_type='audio/wav',
-            headers={
-                'Content-Disposition': 'attachment; filename="cleaned.wav"'
-            }
-        )
+        # 7) Clean up temp files
+        os.remove(noise_path)
+        os.remove(heart_path)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
-    finally:
-        for p in paths.values():
-            if os.path.exists(p):
-                os.remove(p)
+        # Ensure temp files are removed on error
+        for path in (locals().get('noise_path'), locals().get('heart_path')):
+            if path and os.path.exists(path):
+                os.remove(path)
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+    # 8) Send the cleaned audio back as a WAV attachment
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name="cleaned.wav",
+        mimetype="audio/wav"
+    )
+
+
+# Main startup
+if __name__ == "__main__":
+    model_path = "lung_sound_classification_model_1.keras"
+    if os.path.exists(model_path):
+        model = load_audio_model(model_path)
+    else:
+        print(f"Model file not found at {model_path}")
+    app.run(host="0.0.0.0", port=5000, debug=True)

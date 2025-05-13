@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-mangum
+flask
+flask-cors
 tensorflow==2.18.0
-python-multipart
 numpy
 librosa
 noisereduce
